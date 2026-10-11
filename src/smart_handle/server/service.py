@@ -1,31 +1,9 @@
-#!/usr/bin/env python3
-"""스마트 핸들 시스템의 PC용 HTTP AI 분석 서버."""
+"""음성 인식과 소리 분류를 묶어 최종 이벤트를 판단하는 분석 서비스."""
 
 from __future__ import annotations
 
-"""
-PC 서버의 역할:
-1. Raspberry Pi에서 HTTP POST로 보낸 float32 오디오 데이터를 받는다.
-2. Whisper로 한국어 안내 음성을 인식한다.
-3. YAMNet으로 사이렌, 경적, 비명 같은 주변 위험 소리를 분류한다.
-4. 두 결과를 우선순위 기준으로 합쳐 최종 이벤트를 JSON으로 반환한다.
-
-Raspberry Pi가 직접 AI 모델을 돌리지 않는 이유:
-- Whisper와 TensorFlow/YAMNet은 연산량이 커서 Raspberry Pi에서 실행하면 느릴 수 있다.
-- PC 또는 Colab GPU에서 AI 분석을 맡기면 Raspberry Pi는 녹음과 Arduino 통신에 집중할 수 있다.
-"""
-
-# 실행 옵션을 명령어 인자로 받기 위해 사용한다.
-import argparse
-
-# Raspberry Pi와 JSON 형식으로 분석 결과를 주고받기 위해 사용한다.
-import json
-
 # 서버 실행 기록과 오류를 출력하기 위해 사용한다.
 import logging
-
-# API 키를 환경 변수에서 읽기 위해 사용한다.
-import os
 
 # AI 모델을 동시에 호출할 때 충돌하지 않도록 잠금 객체를 사용한다.
 import threading
@@ -36,14 +14,10 @@ import time
 # 소리 분류와 다른 계산을 병렬로 처리하기 위해 사용한다.
 from concurrent.futures import ThreadPoolExecutor
 
-# 별도 웹 프레임워크 없이 간단한 HTTP 서버를 만들기 위해 사용한다.
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-# 실제 AI 모델과 이벤트 판단 함수는 server/ai_logic.py에 모아 두었다.
-from server.ai_logic import (
+# 실제 AI 모델은 models.py, 이벤트 판단 함수는 rules.py에 모아 두었다.
+from smart_handle.server.models import WhisperTranscriber, YamnetClassifier
+from smart_handle.server.rules import (
     EVENT_PRIORITY,
-    WhisperTranscriber,
-    YamnetClassifier,
     detect_sound_event,
     detect_specific_sound_event,
     detect_text_event,
@@ -51,7 +25,7 @@ from server.ai_logic import (
 )
 
 # Raspberry Pi 코드와 같은 이벤트 이름, 같은 샘플레이트를 사용한다.
-from common.protocol import SAMPLE_RATE, Event
+from smart_handle.protocol import SAMPLE_RATE, Event
 
 
 class AiService:
@@ -303,123 +277,3 @@ class AiService:
             # 확인용 상위 YAMNet 예측 결과이다.
             "top_predictions": top_predictions,
         }
-
-
-def make_handler(service: AiService, api_key: str | None):
-    """HTTP 요청을 처리하는 Handler 클래스를 생성한다."""
-
-    class Handler(BaseHTTPRequestHandler):
-        def send_json(self, status: int, body: dict) -> None:
-            """응답 딕셔너리를 JSON으로 변환해서 클라이언트에 보낸다."""
-
-            payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-        def do_GET(self) -> None:
-            """서버 상태 확인용 /health 요청을 처리한다."""
-
-            self.send_json(200, {"status": "ok"}) if self.path == "/health" else self.send_json(
-                404, {"error": "not found"}
-            )
-
-        def do_POST(self) -> None:
-            """Raspberry Pi가 보낸 오디오를 /analyze에서 분석한다."""
-
-            # 이 서버는 오디오 분석 API만 제공하므로 /analyze 외 POST 요청은 거부한다.
-            if self.path != "/analyze":
-                self.send_json(404, {"error": "not found"})
-                return
-
-            # API 키를 설정한 경우 Raspberry Pi 요청에도 같은 키가 들어 있어야 한다.
-            if api_key and self.headers.get("X-API-Key") != api_key:
-                self.send_json(401, {"error": "invalid API key"})
-                return
-
-            # 서버와 클라이언트가 같은 샘플레이트를 사용해야 모델 입력 길이가 정확해진다.
-            if self.headers.get("X-Sample-Rate") != str(SAMPLE_RATE):
-                self.send_json(400, {"error": f"sample rate must be {SAMPLE_RATE}"})
-                return
-            try:
-                # float32 오디오 바이트만 받도록 길이와 배수를 검사한다.
-                # float32는 샘플 하나가 4바이트이므로 전체 길이가 4의 배수여야 한다.
-                length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > SAMPLE_RATE * 4 * 30 or length % 4 != 0:
-                    raise ValueError("audio payload must be between 0 and 30 seconds")
-                import numpy as np
-
-                # Little-endian float32("<f4")로 들어온 바이트를 numpy 배열로 해석한다.
-                result = service.analyze(np.frombuffer(self.rfile.read(length), dtype="<f4"))
-                self.send_json(200, result)
-            except Exception:
-                logging.exception("Analysis failed")
-                self.send_json(500, {"error": "analysis failed"})
-
-        def log_message(self, message: str, *args) -> None:
-            """기본 HTTP 로그도 logging 형식으로 맞춰 출력한다."""
-
-            logging.info("%s - %s", self.client_address[0], message % args)
-
-    return Handler
-
-
-def parse_args() -> argparse.Namespace:
-    """서버 실행에 필요한 설정값을 명령어 인자로 받는다."""
-
-    parser = argparse.ArgumentParser(description=__doc__)
-
-    # 네트워크 접속 설정이다. 0.0.0.0은 같은 네트워크의 Raspberry Pi 접속을 허용한다.
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
-
-    # Whisper 모델 설정이다. Colab GPU에서는 medium/cuda/float16 조합을 사용할 수 있다.
-    parser.add_argument("--whisper-model", default="medium")
-    parser.add_argument("--whisper-device", choices=("cpu", "cuda"), default="cuda")
-    parser.add_argument("--whisper-compute-type", default="int8")
-
-    # 감지 민감도와 분석 창 길이 설정이다.
-    parser.add_argument("--sound-threshold", type=float, default=0.10)
-    parser.add_argument("--speech-threshold", type=float, default=0.10)
-    parser.add_argument("--scream-threshold", type=float, default=0.08)
-    parser.add_argument("--speech-window-seconds", type=float, default=2.0)
-    parser.add_argument("--sound-window-seconds", type=float, default=1.0)
-    parser.add_argument("--hazard-hold-seconds", type=float, default=5.0)
-    parser.add_argument("--voice-rms-threshold", type=float, default=0.005)
-
-    # 공개 네트워크나 ngrok을 사용할 때 임의 접근을 줄이기 위한 선택 설정이다.
-    parser.add_argument("--api-key", default=os.environ.get("SMART_HANDLE_API_KEY"))
-    return parser.parse_args()
-
-
-def main() -> None:
-    """AI 서비스를 만들고 HTTP 서버를 계속 실행한다."""
-
-    args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    service = AiService(
-        args.whisper_model,
-        args.whisper_device,
-        args.whisper_compute_type,
-        args.sound_threshold,
-        args.speech_threshold,
-        args.speech_window_seconds,
-        args.scream_threshold,
-        args.sound_window_seconds,
-        args.hazard_hold_seconds,
-        args.voice_rms_threshold,
-    )
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(service, args.api_key))
-    logging.info("AI server listening on http://%s:%d", args.host, args.port)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logging.info("Stopping")
-    finally:
-        server.server_close()
-
-
-if __name__ == "__main__":
-    main()

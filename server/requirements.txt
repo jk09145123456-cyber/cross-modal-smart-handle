@@ -1,4 +1,0 @@
-numpy
-faster-whisper
-tensorflow
-tensorflow-hub

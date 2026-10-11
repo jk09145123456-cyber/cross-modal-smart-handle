@@ -2,7 +2,6 @@
 
 from enum import Enum
 
-
 # AI 모델 입력은 16 kHz 오디오를 기준으로 맞춘다.
 SAMPLE_RATE = 16_000
 
